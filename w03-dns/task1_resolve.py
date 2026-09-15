@@ -78,7 +78,8 @@ class Resolver:
 
         answers, authority, additional = [], [], []
         section = None
-        for line in text.splitlines():
+        for raw in text.splitlines():
+            line = raw.strip()
             if line.startswith(";; ANSWER SECTION:"):
                 section = "answer"
                 continue
@@ -101,6 +102,13 @@ class Resolver:
                 authority.append(record)
             elif section == "additional":
                 additional.append(record)
+            elif section is None:
+                if rtype.upper() == "NS":
+                    authority.append(record)
+                elif rtype.upper() in {"A", "AAAA", "CNAME"} and record["name"].lower() == name.lower():
+                    answers.append(record)
+                elif rtype.upper() in {"A", "AAAA"}:
+                    additional.append(record)
 
         return {
             "status": status,
@@ -134,9 +142,13 @@ class Resolver:
         seen.add(name)
 
         candidates = list(ROOT_SERVERS)
+        tried = set()
         while candidates:
             next_candidates = []
             for server in candidates:
+                if server in tried:
+                    continue
+                tried.add(server)
                 self.path.append(server)
                 result = self._query(name, server)
                 if result["status"] in {"REFUSED", "SERVFAIL"}:
@@ -157,22 +169,20 @@ class Resolver:
 
                 for ns_name in ns_names:
                     if ns_name in glue:
-                        next_candidates.append(glue[ns_name])
+                        ip = glue[ns_name]
+                        if ip not in tried and ip not in next_candidates:
+                            next_candidates.append(ip)
                         continue
                     try:
                         ip, _ = self._resolve_name(ns_name, seen, depth + 1)
-                        next_candidates.append(ip)
+                        if ip not in tried and ip not in next_candidates:
+                            next_candidates.append(ip)
                     except Exception:
                         pass
 
-                if next_candidates:
-                    candidates = next_candidates
-                    break
-
-            else:
-                continue
             if not next_candidates:
                 break
+            candidates = next_candidates
         raise RuntimeError(f"could not resolve {name!r}")
 
     def resolve(self, name):
