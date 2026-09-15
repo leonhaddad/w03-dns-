@@ -43,36 +43,141 @@ VERIFY_NAMES = [
 
 
 class Resolver:
-    """Your iterative resolver.
+    """A small iterative resolver built on top of dig.
 
-    The whole point is that you never ask a server to recurse for you.
-    You ask one server, it says "not mine, ask over there", and you go there.
-
-    Suggested shape - but it is yours to design:
-
-        resolve(name) -> (address, path)
-            address : the A record you ended up with, as a string
-            path    : the servers you asked, in order, so you can show your work
-
-    Things you will hit, in roughly this order:
-
-    1.  A delegation gives you NS *names*, sometimes with glue A records and
-        sometimes without. No glue means you have to resolve that nameserver's
-        name first - which is another walk. Decide what you do there.
-    2.  A server may not answer. Try the next one rather than giving up.
-    3.  CNAMEs. The answer you get back may be a different name than the one
-        you asked for, and you have to start again with that name.
-    4.  Loops. Cap your depth.
-
-    If you shell out to dig, the flag you want is `+norecurse`, so that the
-    server you ask replies with a delegation instead of doing the work:
-
-        dig @198.41.0.4 www.korea.ac.kr +norecurse
+    It asks a server for the next delegation, follows NS names to their
+    addresses, and keeps going until it reaches an authoritative A answer.
     """
 
+    def __init__(self):
+        self.path = []
+
+    def _query(self, name, server):
+        args = [
+            "dig",
+            f"@{server}",
+            "+norecurse",
+            "+time=2",
+            "+tries=1",
+            "+noall",
+            "+answer",
+            "+authority",
+            "+additional",
+            name,
+            "A",
+        ]
+        out = subprocess.run(args, capture_output=True, text=True)
+        text = out.stdout.strip()
+        if not text:
+            return {"status": "NOANSWER", "answers": [], "authority": [], "additional": []}
+
+        status = "NOERROR"
+        match = __import__("re").search(r"status:\s*(\S+)", text, __import__("re").IGNORECASE)
+        if match:
+            status = match.group(1).upper()
+
+        answers, authority, additional = [], [], []
+        section = None
+        for line in text.splitlines():
+            if line.startswith(";; ANSWER SECTION:"):
+                section = "answer"
+                continue
+            if line.startswith(";; AUTHORITY SECTION:"):
+                section = "authority"
+                continue
+            if line.startswith(";; ADDITIONAL SECTION:"):
+                section = "additional"
+                continue
+            if not line or line.startswith(";;") or line.startswith(";"):
+                continue
+            m = __import__("re").match(r"^(\S+)\s+\d+\s+IN\s+(\S+)\s+(.*)$", line)
+            if not m:
+                continue
+            name_r, rtype, data = m.groups()
+            record = {"name": name_r.rstrip("."), "type": rtype.upper(), "data": data.strip()}
+            if section == "answer":
+                answers.append(record)
+            elif section == "authority":
+                authority.append(record)
+            elif section == "additional":
+                additional.append(record)
+
+        return {
+            "status": status,
+            "answers": answers,
+            "authority": authority,
+            "additional": additional,
+        }
+
+    def _addresses_from_answer(self, answer_records):
+        return [r["data"] for r in answer_records if r["type"] == "A"]
+
+    def _cname_from_answer(self, answer_records):
+        c = [r["data"].rstrip(".") for r in answer_records if r["type"] == "CNAME"]
+        return c[0] if c else None
+
+    def _delegation(self, authority, additional):
+        ns_names = [r["data"].rstrip(".") for r in authority if r["type"] == "NS"]
+        glue = {}
+        for r in additional:
+            if r["type"] == "A":
+                glue[r["name"].rstrip(".")] = r["data"]
+        return ns_names, glue
+
+    def _resolve_name(self, name, seen, depth):
+        name = name.rstrip(".")
+        if depth > 20:
+            raise RuntimeError(f"loop detected resolving {name!r}")
+        if name in seen:
+            raise RuntimeError(f"loop detected resolving {name!r}")
+        seen = set(seen)
+        seen.add(name)
+
+        candidates = list(ROOT_SERVERS)
+        while candidates:
+            next_candidates = []
+            for server in candidates:
+                self.path.append(server)
+                result = self._query(name, server)
+                if result["status"] in {"REFUSED", "SERVFAIL"}:
+                    continue
+
+                answers = result["answers"]
+                addrs = self._addresses_from_answer(answers)
+                if addrs:
+                    return addrs[0], list(self.path)
+
+                cname = self._cname_from_answer(answers)
+                if cname:
+                    return self._resolve_name(cname, seen, depth + 1)
+
+                ns_names, glue = self._delegation(result["authority"], result["additional"])
+                if not ns_names:
+                    continue
+
+                for ns_name in ns_names:
+                    if ns_name in glue:
+                        next_candidates.append(glue[ns_name])
+                        continue
+                    try:
+                        ip, _ = self._resolve_name(ns_name, seen, depth + 1)
+                        next_candidates.append(ip)
+                    except Exception:
+                        pass
+
+                if next_candidates:
+                    candidates = next_candidates
+                    break
+
+            else:
+                continue
+            if not next_candidates:
+                break
+        raise RuntimeError(f"could not resolve {name!r}")
+
     def resolve(self, name):
-        raise NotImplementedError(
-            "Implement the iterative walk: root -> TLD -> authoritative")
+        self.path = []
+        return self._resolve_name(name, set(), 0)
 
 
 # ------------------------------------------------------------------- harness
